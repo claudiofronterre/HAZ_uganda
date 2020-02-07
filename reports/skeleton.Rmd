@@ -1,0 +1,329 @@
+---
+output: 
+  pdf_document:
+    citation_package: natbib
+    keep_tex: true
+    fig_caption: true
+    latex_engine: pdflatex
+    template: template.tex
+    number_sections: false
+title: "HAZ in Uganda"
+#thanks: "**Corresponding author**: c.fronterr@lancaster.ac.uk."
+# author:
+#   name: Claudio Fronterre
+#   affiliation: CHICAS, Lancaster University
+abstract: "This report contains the R code and output of an analysis conducted on HAZ with DHS data from Uganda"
+# keywords: "keyword1, keyword2, Keyword3"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+geometry: margin=1in
+fontfamily: mathpazo
+fontsize: 11pt
+header-includes:
+- \usepackage[english]{babel}
+- \usepackage{booktabs}
+- \usepackage{longtable}
+- \usepackage{array}
+- \usepackage{multirow}
+- \usepackage[table]{xcolor}
+- \usepackage{wrapfig}
+- \usepackage{float}
+- \usepackage{colortbl}
+- \usepackage{pdflscape}
+- \usepackage{tabu}
+- \usepackage{threeparttable}
+- \usepackage{threeparttablex}
+- \usepackage[normalem]{ulem}
+- \usepackage{makecell}
+#spacing: double
+bibliography: biblio.bib
+biblio-style: apalike
+endnote: no
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, cache = T, warning = F, message = F)
+```
+
+
+```{r load_packages}
+# Load all packages needed for the analysis
+if (!require("pacman")) install.packages("pacman")
+pkgs = c("sf", "dplyr", "PrevMap", "ggplot2", "tmap")
+pacman::p_load(pkgs, character.only = T)
+
+# Load external functions
+source("R/functions.R")
+```
+
+# Data cleaning
+
+Coordinates were converted from lat/long WGS84 to UTM zone 35N (in Km). 10 clusters have been removed from the analysis because lat and long was not available. In the original dataset the HAZ ranges from a minimum of -6 to a maximum of 99.98. A total of 22 individuals were removed because an extreme value of HAZ was reporterd (equal to 99.98). Other 26 individuals have been removed because either HAZ or vitamin A was not recorded.
+
+```{r data_cleaning}
+# Load HAZ data
+haz <- readr::read_csv("data/stunting_ug.csv")
+
+# Remove missing LAT LONG (some entries have 0 values)
+# Remove also non admissable values for HAZ (== 99.98 and missing values)
+# Remove individuals with missing vitamin A
+haz <- haz %>% 
+  filter(LONGNUM != 0, !is.na(HAZ), HAZ < 50, !is.na(VitaminA_microgram_per_Ml))
+
+# Convert the LAT LONG coordinates to UTM (km) EPSSG: 32365
+crs_utm_km <- epsgKM(32635)
+haz_sp <- haz %>% 
+  st_as_sf(coords = c("LONGNUM", "LATNUM"), crs = 4326) %>% 
+  st_transform(crs = crs_utm_km)
+
+# For a quick interactive view of the data run the following line of code
+# mapview::mapview(haz_sp)
+
+# Add two new columns with the coordinates in UTM (km)
+haz[, c("utm_x", "utm_y")] <- st_coordinates(haz_sp)
+
+# Transform vitamin A to the log scale
+haz$log_VITA <- log(haz$VitaminA_microgram_per_Ml)
+
+# Select only the columns relevant for the anlysis
+haz <- haz %>% 
+  dplyr::select(HAZ, log_VITA, agem = Age_Month, 
+                Cluster_ID, utm_x, utm_y) 
+
+# Check if there are any missing values
+missing <- sapply(haz, function(x) sum(is.na(x)))
+knitr::kable(missing, col.names = "Number of missing")
+```
+
+# Raster covariates
+
+```{r covariates}
+# Load shapefile for Uganda
+uga <- st_read("data/geodata/gadm36_UGA.gpkg", layer = "gadm36_UGA_0")
+
+# Convert to the reference system of the points
+uga <- st_transform(uga, crs = crs_utm_km)
+
+# Load population raster
+pop <- raster("data/geodata/pop2016_100m.tif")
+
+# Create prediction grid
+pred <- create_grid(resolution = 1, study_area = uga, pop = pop, 
+                    cutoff = 0)
+
+# Load raster covariates and align them to the prediction grid
+elevation <- raster("data/geodata/elevation2000_100m.tif")
+slope <- raster("data/geodata/slope2000_100m.tif")
+evi <- raster("data/geodata/evi2016_1km.tif")
+
+elevation <- align_raster(pred = pred$raster, cov = elevation)
+slope <- align_raster(pred = pred$raster, cov = slope)
+evi <- align_raster(pred = pred$raster, cov = evi)
+
+# Stack all the raster covariates together
+covariates <- stack(elevation, slope, evi)
+
+# Extract them at the observed locations
+cov_obs  <- extract(covariates, haz[, c("utm_x", "utm_y")])
+
+# Fill NA
+idna <- which(is.na(cov_obs[, 1]))
+cov_obs[idna, ] <- extract(covariates, haz[idna, c("utm_x", "utm_y")],
+                           method = "bilinear")
+
+haz[, c("elevation", "slope", "evi")] <- cov_obs
+
+# Remove NA
+# haz <- haz[!is.na(haz$elevation), ]
+```
+
+
+# Relationship between HAZ and individual variables
+
+Let's have a look at the relationship between HAZ scores and individual levle variables. If this relatioship turns out to be non-linear we will accomodate for it. From \autoref{fig:individual_rel} we can't really see a clear relationship between vitamin A and HAZ. For age, it looks like there is a decrease in HAZ until approximately 20 months and then no relationship. 
+
+```{r individual_rel, fig.align='center', fig.cap="Scatterplot of the relationship between age (in month) and vitamin A (log scale) with HAZ. The blue line shows the fit of a GAM model (with a thin plate regression spline).", fig.pos="H", fig.width=6, fig.height=3}
+haz %>% 
+  dplyr::select(HAZ, log_VITA, agem) %>% 
+  tidyr::gather(key = "variable", value = "value", -HAZ) %>% 
+  ggplot(aes(x = value, y = HAZ)) +
+  geom_point(shape = 21, fill = "black", alpha = .3, size = .5) +
+  geom_smooth(method = "gam", formula = y ~ s(x), size = .5) +
+  facet_wrap(~ variable, scales = "free", 
+             labeller = labeller(variable = function(x) c("Age (months)", "Vitamin A (log)"))) +
+  labs(y = "HAZ") +
+  theme_bw()
+```
+
+
+```{r agevshaz, fig.align='center', fig.cap="Comparison of the fit of a GAM and piece-wise linear regression to age and HAZ.", fig.pos="H"}
+# Compare different models for HAZ vs. age
+library(splines)
+ggplot(haz, aes(x = agem, y = HAZ)) +
+  geom_point(shape = 21, fill = "black", alpha = .3, size = 1) +
+  geom_smooth(method = "gam", formula = y ~ s(x), aes(col = "GAM", fill = "GAM"),
+              size = 1) +
+  geom_smooth(method = "lm", formula = y ~ bs(x, knots = 17.84, degree = 1),
+              aes(col = "LINEAR", fill = "LINEAR"), size = 1) +
+  labs(x = "Age (months)", y = "HAZ") +
+  scale_color_brewer("Model fit", type = "q", palette = 6) +
+  scale_fill_brewer("Model fit", type = "q", palette = 6) +
+  theme_bw()
+
+# Find optimal break point
+# fcost <- function(param) {
+#   fit <- lm(HAZ ~ bs(agem, knots = param, degree = 1), data = haz)
+#   aic <- AIC(fit)
+#   return(aic)
+# }
+# 
+# optim(par= 0, fn = fcost, method = "Brent", lower = -2, upper = 2)
+```
+
+# Non-spatial model
+
+Here we fit the following linear mixed model to the HAZ data
+\begin{equation}
+Y_j(x_i)=\alpha+\gamma d_{ij} + \beta d(x_i) + U_{i} + Z_{ij}
+\end{equation}
+where $Y_j(x_i)$ denotes the HAZ of the $j$th child at cluster location $x_i$, $d_{ij}$ is a vector of individual level covariates (age and vitamin A), $d(x_i)$ is the vector of spatially referenced environmental variables (elevation, slope and EVI). $U_{i}$ and $Z_{ij}$ are two set of independent normally distributed random effects who capture cluster level and individual level variation respectively. We use the estimated $\hat{U_i}$ to calculate the variogram and check the presence of residual spatial variation.
+
+```{r mixed_model}
+# Load package to fit Mixed Model
+library(lme4)
+
+# Before fitting this type of models it is alway a good idea to rescale the
+# numeric variables (substract the mean and divide by the standard devation)
+# to avoid problem of convergence
+
+# Scale the numeric covariates
+# num_covariates <- c("agem", "log_VITA", "elevation", "slope", "evi")
+# haz[, num_covariates] <- scale(haz[, num_covariates])
+
+# Create new ID for clusters
+haz <- as.data.frame(haz)
+haz$ID <- create.ID.coords(data = haz, ~ utm_x + utm_y)
+haz$Cluster_ID <- NULL
+
+# Formula
+f <- HAZ ~ agem + I((agem - 17.84) * (agem > 17.84)) + log_VITA + 
+  elevation + slope + evi
+
+# Formula with cluster level random effects
+fcluster <- update(f, ~ . + (1|ID))
+
+# Fit the model in equation (1)
+fit <- lmer(formula = fcluster, data = haz)
+
+# Generate summary of the model
+summary(fit)
+
+# Extract the random effects at cluster level U_i
+reff <- ranef(fit)$ID$`(Intercept)`
+
+# Extract coordinates for each cluster
+coords <- haz %>%
+  distinct(ID, utm_x, utm_y) %>% 
+  arrange(ID) %>% 
+  dplyr::select(utm_x, utm_y)
+
+# Compute and plot variogram
+ggvario(coords = coords, data = reff, nsim = 1000, show_nbins = F, maxdist = 150) 
+```
+
+# Geostatistical model
+
+We improve equation (1) by replacing the cluster level random effects with a spatial gaussian process and we fit the following geostatistical model
+\begin{equation}
+Y_j(x_i)=\alpha+\gamma d_{ij} + \beta d(x_i) + S(x_{i}) + Z_{ij}
+\end{equation}
+
+```{r geo_model}
+fit_geo <- linear.model.MLE(formula = f,
+                            coords = ~ utm_x + utm_y, 
+                            ID.coords = haz$ID,
+                            data = haz,
+                            start.cov.pars = c(15, 0.2),
+                            fixed.rel.nugget = 0, kappa = 0.5, method = "nlminb", 
+                            messages = F)
+summary(fit_geo, l = F)
+
+# Save the results
+# saveRDS(fit_geo, file = "output/fit_geo_070220.rds")
+```
+
+# Predictions
+
+```{r predictions}
+# Extract values of covariates at prediction locations
+cov_pred <- extract(covariates, pred$coords)
+cov_pred <- as.data.frame(cov_pred)
+names(cov_pred) <- c("elevation", "slope", "evi")
+
+cov_pred$agem <- mean(haz$agem)
+cov_pred$log_VITA <- mean(haz$log_VITA)
+
+# Generate distribution of predictors at individual level
+# nsim <- 1000
+# 
+# pred_samples <- list()
+# age_samples <- rnorm(nsim, mean = mean(haz$agem), sd = sd(haz$agem))
+# age_samples[age_samples < min(haz$agem)] <- min(haz$agem)
+# age_samples[age_samples > max(haz$agem)] <- max(haz$agem)
+# 
+# log_VITA_samples <- rnorm(nsim, mean = mean(haz$log_VITA), sd = sd(haz$log_VITA))
+# for(i in 1:nsim) {
+#   pred_samples[[i]] <- data.frame(agem = rep(age_samples[i], nrow(pred$coords)),
+#                                   log_VITA = rep(log_VITA_samples[i], nrow(pred$coords)))
+# }
+
+# Obtain predictions
+predictions <- spatial.pred.linear.MLE(fit_geo, 
+                                       grid.pred = pred$coords, 
+                                       predictors = cov_pred, 
+                                       n.sim.prev = nsim,
+                                       scale.predictions = "logit",
+                                       thresholds = -2,
+                                       scale.thresholds = "logit")
+predictions$exceedance.prob <- 1 - predictions$exceedance.prob
+
+# Save predictions
+# saveRDS(predictions, "output/geo_pred_070220.rds")
+```
+
+```{r maps}
+haz_pred <- rasterFromXYZ(data.frame(pred$coords, 
+                                     haz = predictions$logit$predictions,
+                                     pstunting = as.numeric(predictions$exceedance.prob)))
+
+tm_shape(haz_pred) +
+  tm_raster(col = "haz", palette = "RdYlBu", legend.show = T, style = "cont",
+            title = "Predicted mean HAZ") +
+tm_shape(uga, is.master = T,) +
+  tm_borders("black", lwd = 1) +
+  tm_compass(position = c("right", "top")) +
+  tm_scale_bar(position = c("right", "bottom")) +
+  tm_layout(design.mode = F, legend.bg.color = "white", scale = 1.2,
+            legend.position = c("left", "top"), frame = T, outer.margins = 0, asp = 0) 
+
+
+pal_ex <- tmaptools::get_brewer_pal("-RdYlBu", n = 10, contrast = c(0, 1), plot = F)
+
+tm_shape(haz_pred) +
+  tm_raster(col = "pstunting", palette = pal_ex, legend.show = F,
+            style = "fixed", breaks = seq(0, 1, by = .1)) +
+  tm_add_legend(type = "fill",
+                labels = c("0 - 0.1", "0.1 - 0.2", "0.2 - 0.3", "0.3 - 0.4", "0.4 - 0.5",
+                         "0.5 - 0.6", "0.6 - 0.7", "0.7 - 0.8", "0.8 - 0.9", "0.9 - 1"),
+                col = pal_ex, size = .5, alpha = 1,
+                title = "Probability of\nstunting",
+                is.portrait = T) +
+tm_shape(uga, is.master = T,) +
+  tm_borders("black", lwd = 1) +
+  tm_compass(position = c("right", "top")) +
+  tm_scale_bar(position = c("right", "bottom")) +
+  tm_layout(design.mode = F, legend.bg.color = "white", scale = 1.2,
+            legend.position = c("left", "top"), frame = T, outer.margins = 0, asp = 0)
+```
+

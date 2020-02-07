@@ -1,0 +1,15 @@
+base
+pacman
+sf
+dplyr
+geoR
+miscTools
+maxLik
+sp
+raster
+pdist
+Matrix
+PrevMap
+ggplot2
+lme4
+tmap
